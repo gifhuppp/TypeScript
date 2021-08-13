@@ -263,30 +263,6 @@ namespace ts {
         Uncapitalize: IntrinsicTypeKind.Uncapitalize
     }));
 
-    enum TypeChecks {
-        Ok,
-        HasDiagnostic
-    }
-
-    interface CheckerResultOk {
-        result: TypeChecks.Ok
-    }
-
-    interface CheckerResultHasDiagnostic {
-        result: TypeChecks.HasDiagnostic,
-        message: DiagnosticMessage;
-        args:
-            | never[]
-            | [string | number]
-            | [string | number, string | number]
-            | [string | number, string | number, string | number]
-            | [string | number, string | number, string | number, string | number];
-    }
-
-    type CheckerResult =
-        | CheckerResultOk
-        | CheckerResultHasDiagnostic;
-
     function SymbolLinks(this: SymbolLinks) {
     }
 
@@ -736,9 +712,7 @@ namespace ts {
 
             getLocalTypeParametersOfClassOrInterfaceOrTypeAlias,
             isDeclarationVisible,
-            isPropertyAccessible: (node, isSuper, writing, type, prop) => {
-                return checkPropertyAccessibilityAtNode(node, isSuper, writing, type, prop).result === TypeChecks.Ok;
-            }
+            isPropertyAccessible,
         };
 
         function getResolvedSignatureWorker(nodeIn: CallLikeExpression, candidatesOutArray: Signature[] | undefined, argumentCount: number | undefined, checkMode: CheckMode): Signature | undefined {
@@ -27293,35 +27267,28 @@ namespace ts {
             node: PropertyAccessExpression | QualifiedName | PropertyAccessExpression | VariableDeclaration | ParameterDeclaration | ImportTypeNode | PropertyAssignment | ShorthandPropertyAssignment | BindingElement,
             isSuper: boolean, writing: boolean, type: Type, prop: Symbol, reportError = true): boolean {
 
-            const errorNode = node.kind === SyntaxKind.QualifiedName ? node.right :
+            const errorNode = !reportError ? undefined : node.kind === SyntaxKind.QualifiedName ? node.right :
                 node.kind === SyntaxKind.ImportType ? node :
                 node.kind === SyntaxKind.BindingElement && node.propertyName ? node.propertyName : node.name;
 
-            const typeChecks = checkPropertyAccessibilityAtNode(node, isSuper, writing, type, prop);
-            switch (typeChecks.result) {
-                case (TypeChecks.Ok):
-                    return true;
-                case (TypeChecks.HasDiagnostic):
-                    if (reportError) {
-                        error(errorNode, typeChecks.message, ...typeChecks.args);
-                    }
-                    return false;
-            }
+            return checkPropertyAccessibilityAtLocation(node, isSuper, writing, type, prop, errorNode);
         }
 
-        // Possible concerns:
-        // (1) I'm not sure if this function has the right behavior if `node` is allowed to be any node,
-        // although we only use `node` for its location in the parse tree.
-        // (2) Does it even make sense to check for property accessibility at a certain arbitrary node?
-        // Maybe this function should be called "checkPropertyVisibilityAtNode" or something else.
-        function checkPropertyAccessibilityAtNode(node: Node,
+        /**
+         * Check whether the requested property can be accessed at the requested location.
+         * Returns true if node is a valid property access, and false otherwise.
+         * @param location The location node where we want to check if the property is accessible.
+         * @param isSuper True if the access is from `super.`.
+         * @param writing True if this is a write property access, false if it is a read property access.
+         * @param type The type of the object whose property is being accessed. (Not the type of the property.)
+         * @param prop The symbol for the property being accessed.
+         * @param errorNode The node where we should report an invalid property access error, or undefined if we should not report errors.
+         */
+        function checkPropertyAccessibilityAtLocation(location: Node,
             isSuper: boolean, writing: boolean,
-            type: Type, prop: Symbol): CheckerResult {
-            const flags = getDeclarationModifierFlagsFromSymbol(prop, writing);
+            type: Type, prop: Symbol, errorNode?: Node): boolean {
 
-            const checkerOk: CheckerResultOk = {
-                result: TypeChecks.Ok
-            };
+            const flags = getDeclarationModifierFlagsFromSymbol(prop, writing);
 
             if (isSuper) {
                 // TS 1.0 spec (April 2014): 4.8.2
@@ -27333,11 +27300,10 @@ namespace ts {
                 //   a super property access is permitted and must specify a public static member function of the base class.
                 if (languageVersion < ScriptTarget.ES2015) {
                     if (symbolHasNonMethodDeclaration(prop)) {
-                        return {
-                            result: TypeChecks.HasDiagnostic,
-                            message: Diagnostics.Only_public_and_protected_methods_of_the_base_class_are_accessible_via_the_super_keyword,
-                            args: emptyArray
-                        };
+                        if (errorNode) {
+                            error(errorNode, Diagnostics.Only_public_and_protected_methods_of_the_base_class_are_accessible_via_the_super_keyword);
+                        }
+                        return false;
                     }
                 }
                 if (flags & ModifierFlags.Abstract) {
@@ -27345,30 +27311,34 @@ namespace ts {
                     // This error could mask a private property access error. But, a member
                     // cannot simultaneously be private and abstract, so this will trigger an
                     // additional error elsewhere.
-                    return {
-                        result: TypeChecks.HasDiagnostic,
-                        message: Diagnostics.Abstract_method_0_in_class_1_cannot_be_accessed_via_super_expression,
-                        args: [symbolToString(prop), typeToString(getDeclaringClass(prop)!)]
-                    };
+                    if (errorNode) {
+                        error(errorNode,
+                            Diagnostics.Abstract_method_0_in_class_1_cannot_be_accessed_via_super_expression,
+                            symbolToString(prop),
+                            typeToString(getDeclaringClass(prop)!));
+                    }
+                    return false;
                 }
             }
 
             // Referencing abstract properties within their own constructors is not allowed
             if ((flags & ModifierFlags.Abstract) && symbolHasNonMethodDeclaration(prop) &&
-                (isThisProperty(node) || isThisInitializedObjectBindingExpression(node) || isObjectBindingPattern(node.parent) && isThisInitializedDeclaration(node.parent.parent))) {
+                (isThisProperty(location) || isThisInitializedObjectBindingExpression(location) || isObjectBindingPattern(location.parent) && isThisInitializedDeclaration(location.parent.parent))) {
                 const declaringClassDeclaration = getClassLikeDeclarationOfSymbol(getParentOfSymbol(prop)!);
-                if (declaringClassDeclaration && isNodeUsedDuringClassInitialization(node)) {
-                    return {
-                        result: TypeChecks.HasDiagnostic,
-                        message: Diagnostics.Abstract_property_0_in_class_1_cannot_be_accessed_in_the_constructor,
-                        args: [symbolToString(prop), getTextOfIdentifierOrLiteral(declaringClassDeclaration.name!)]
-                    };
+                if (declaringClassDeclaration && isNodeUsedDuringClassInitialization(location)) {
+                    if (errorNode) {
+                        error(errorNode,
+                            Diagnostics.Abstract_property_0_in_class_1_cannot_be_accessed_in_the_constructor,
+                            symbolToString(prop),
+                            getTextOfIdentifierOrLiteral(declaringClassDeclaration.name!));
+                    }
+                    return false;
                 }
             }
 
             // Public properties are otherwise accessible.
             if (!(flags & ModifierFlags.NonPublicAccessibilityModifier)) {
-                return checkerOk;
+                return true;
             }
 
             // Property is known to be private or protected at this point
@@ -27376,26 +27346,28 @@ namespace ts {
             // Private property is accessible if the property is within the declaring class
             if (flags & ModifierFlags.Private) {
                 const declaringClassDeclaration = getClassLikeDeclarationOfSymbol(getParentOfSymbol(prop)!)!;
-                if (!isNodeWithinClass(node, declaringClassDeclaration)) {
-                    return {
-                        result: TypeChecks.HasDiagnostic,
-                        message: Diagnostics.Property_0_is_private_and_only_accessible_within_class_1,
-                        args: [symbolToString(prop), typeToString(getDeclaringClass(prop)!)]
-                    };
+                if (!isNodeWithinClass(location, declaringClassDeclaration)) {
+                    if (errorNode) {
+                        error(errorNode,
+                            Diagnostics.Property_0_is_private_and_only_accessible_within_class_1,
+                            symbolToString(prop),
+                            typeToString(getDeclaringClass(prop)!));
+                    }
+                    return false;
                 }
-                return checkerOk;
+                return true;
             }
 
             // Property is known to be protected at this point
 
             // All protected properties of a supertype are accessible in a super access
             if (isSuper) {
-                return checkerOk;
+                return true;
             }
 
             // Find the first enclosing class that has the declaring classes of the protected constituents
             // of the property as base classes
-            let enclosingClass = forEachEnclosingClass(node, enclosingDeclaration => {
+            let enclosingClass = forEachEnclosingClass(location, enclosingDeclaration => {
                 const enclosingClass = getDeclaredTypeOfSymbol(getSymbolOfNode(enclosingDeclaration)!) as InterfaceType;
                 return isClassDerivedFromDeclaringClasses(enclosingClass, prop, writing) ? enclosingClass : undefined;
             });
@@ -27404,12 +27376,14 @@ namespace ts {
                 // allow PropertyAccessibility if context is in function with this parameter
                 // static member access is disallow
                 let thisParameter: ParameterDeclaration | undefined;
-                if (flags & ModifierFlags.Static || !(thisParameter = getThisParameterFromNodeContext(node)) || !thisParameter.type) {
-                    return {
-                        result: TypeChecks.HasDiagnostic,
-                        message: Diagnostics.Property_0_is_protected_and_only_accessible_within_class_1_and_its_subclasses,
-                        args: [symbolToString(prop), typeToString(getDeclaringClass(prop) || type)]
-                    };
+                if (flags & ModifierFlags.Static || !(thisParameter = getThisParameterFromNodeContext(location)) || !thisParameter.type) {
+                    if (errorNode) {
+                        error(errorNode,
+                            Diagnostics.Property_0_is_protected_and_only_accessible_within_class_1_and_its_subclasses,
+                            symbolToString(prop),
+                            typeToString(getDeclaringClass(prop) || type));
+                    }
+                    return false;
                 }
 
                 const thisType = getTypeFromTypeNode(thisParameter.type);
@@ -27417,20 +27391,21 @@ namespace ts {
             }
             // No further restrictions for static properties
             if (flags & ModifierFlags.Static) {
-                return checkerOk;
+                return true;
             }
             if (type.flags & TypeFlags.TypeParameter) {
                 // get the original type -- represented as the type constraint of the 'this' type
                 type = (type as TypeParameter).isThisType ? getConstraintOfTypeParameter(type as TypeParameter)! : getBaseConstraintOfType(type as TypeParameter)!; // TODO: GH#18217 Use a different variable that's allowed to be undefined
             }
             if (!type || !hasBaseType(type, enclosingClass)) {
-                return {
-                    result: TypeChecks.HasDiagnostic,
-                    message: Diagnostics.Property_0_is_protected_and_only_accessible_through_an_instance_of_class_1_This_is_an_instance_of_class_2,
-                    args: [symbolToString(prop), typeToString(enclosingClass), typeToString(type)]
-                };
+                if (errorNode) {
+                    error(errorNode,
+                        Diagnostics.Property_0_is_protected_and_only_accessible_through_an_instance_of_class_1_This_is_an_instance_of_class_2,
+                        symbolToString(prop), typeToString(enclosingClass), typeToString(type));
+                }
+                return false;
             }
-            return checkerOk;
+            return true;
         }
 
         function getThisParameterFromNodeContext(node: Node) {
@@ -27726,7 +27701,7 @@ namespace ts {
                 checkPropertyNotUsedBeforeDeclaration(prop, node, right);
                 markPropertyAsReferenced(prop, node, isSelfTypeAccess(left, parentSymbol));
                 getNodeLinks(node).resolvedSymbol = prop;
-                const writing = isWriteAccess(node);
+                const writing = isWriteAccess(node); // Look here for `isSuper`, `writing`
                 checkPropertyAccessibility(node, left.kind === SyntaxKind.SuperKeyword, writing, apparentType, prop);
                 if (isAssignmentToReadonlyEntity(node as Expression, prop, assignmentKind)) {
                     error(right, Diagnostics.Cannot_assign_to_0_because_it_is_a_read_only_property, idText(right));
@@ -28151,7 +28126,12 @@ namespace ts {
         }
 
         function isValidPropertyAccessForCompletions(node: PropertyAccessExpression | ImportTypeNode | QualifiedName, type: Type, property: Symbol): boolean {
-            return isValidPropertyAccessWithType(node, node.kind === SyntaxKind.PropertyAccessExpression && node.expression.kind === SyntaxKind.SuperKeyword, property.escapedName, type);
+            // return isValidPropertyAccessWithType(node, node.kind === SyntaxKind.PropertyAccessExpression && node.expression.kind === SyntaxKind.SuperKeyword, property, type);
+            return isPropertyAccessible(node,
+                node.kind === SyntaxKind.PropertyAccessExpression && node.expression.kind === SyntaxKind.SuperKeyword,
+                /* isWriteAccess */ false,
+                type,
+                property);
             // Previously we validated the 'this' type of methods but this adversely affected performance. See #31377 for more context.
         }
 
@@ -28161,19 +28141,39 @@ namespace ts {
             propertyName: __String,
             type: Type): boolean {
 
+            // Short-circuiting for improved performance
             if (type === errorType || isTypeAny(type)) {
                 return true;
             }
+
             const prop = getPropertyOfType(type, propertyName);
-            if (prop) {
-                if (prop.valueDeclaration && isPrivateIdentifierClassElementDeclaration(prop.valueDeclaration)) {
-                    const declClass = getContainingClass(prop.valueDeclaration);
-                    return !isOptionalChain(node) && !!findAncestor(node, parent => parent === declClass);
-                }
-                return checkPropertyAccessibility(node, isSuper, /*writing*/ false, type, prop, /* reportError */ false);
+            if (prop) { // TODO: move to `isPropertyAccessible`
+                return isPropertyAccessible(node, isSuper, /* isWriteAccess */ false, type, prop);
             }
+
             // In js files properties of unions are allowed in completion
             return isInJSFile(node) && (type.flags & TypeFlags.Union) !== 0 && (type as UnionType).types.some(elementType => isValidPropertyAccessWithType(node, isSuper, propertyName, elementType));
+        }
+
+        function isPropertyAccessible(node: Node, isSuper: boolean, isWriteAccess: boolean, type: Type, prop: Symbol): boolean {
+            /* TODO: compute isSuper? */
+            // Probably don't want to compute `isSuper`,
+            // since we'd like this function to be usable both for already existing property accesses
+            // and for possible, yet to exist property accesses (e.g. in a completions scenario).
+
+            // Short-circuiting for improved performance.
+            if (type === errorType || isTypeAny(type)) {
+                return true;
+            }
+
+            // A #private property access in an optional chain is an error dealt with by the parser.
+             // The checker does not check for it, so we need to do our own check here.
+             if (prop.valueDeclaration && isPrivateIdentifierClassElementDeclaration(prop.valueDeclaration)) {
+                const declClass = getContainingClass(prop.valueDeclaration);
+                return !isOptionalChain(node) && !!findAncestor(node, parent => parent === declClass);
+            }
+
+            return checkPropertyAccessibilityAtLocation(node, isSuper, isWriteAccess, type, prop);
         }
 
         /**
